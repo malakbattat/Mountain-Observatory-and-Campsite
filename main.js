@@ -1,150 +1,141 @@
 "use strict";
-// main.js - WebGL setup, shared drawing interface, and the main rendering loop.
-//
-// ===================== TEAM CONVENTIONS (agree on these first) =====================
-// Coordinates : right-handed, +Y is UP, ground plane = XZ, 1 unit = 1 world unit.
-// Angles      : radians. rotateY > 0 turns counter-clockwise seen from above.
-// Transforms  : M = T * R * S. A part is placed with stack.translate / rotate, and sized
-//               by the `size` argument of ctx.drawPart. Size is applied to a COPY of the
-//               matrix, so children never inherit their parent's shape size.
-// Hierarchy   : stack.push() ... stack.pop(). A component must leave the stack at the
-//               same depth it found it. On entry, stack.current = the parent's matrix.
-// Shapes      : see the header of js/primitives.js (all sizes/origins are listed there).
-// Colors      : [r, g, b] in 0..1.
-//
-// ===================== COMPONENT INTERFACE =====================
-// A component is a function  drawXxx(ctx)  that draws one part of the scene
-// (and its children). Add it to the COMPONENTS list below.
-//   ctx.stack       MatrixStack          (push / pop / translate / rotateX|Y|Z / scale)
-//   ctx.drawPart(meshName, [sx,sy,sz], [r,g,b], { unlit: true })   draws a primitive
-//   ctx.meshes      names: cube cylinder cone sphere hemisphere prism plane
-//   ctx.time        seconds since start      ctx.dt  seconds since last frame
-//   ctx.camera, ctx.lighting, ctx.gl
-// ================================================================
 
-const COMPONENTS = [
-  drawDemoScene,      // test scene - DELETE this line (and the function below) when real components exist
-  // drawTerrain, drawTrees, drawCampsite, drawObservatory, drawSky,
-];
 
-const canvas = document.getElementById("glCanvas");
-const gl = GLUtils.initGL(canvas);
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl");
+if (!gl) {
+  alert("WebGL not supported on this browser.");
+  throw new Error("WebGL not supported");
+}
 
-const stack    = new MatrixStack();
-const camera   = new Camera();
-const lighting = new Lighting();
-const meshes   = {};                 // name -> GPU mesh
-let locs = null;                     // shader locations
-let lastTime = 0;
 
-// ---------- shared drawing interface ----------
-// Draw a primitive in the CURRENT coordinate system of the stack.
-function drawPart(meshName, size, color, options = {}) {
-  const mesh = meshes[meshName];
-  if (!mesh) throw new Error("Unknown mesh: " + meshName);
+async function loadText(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to load ${url}`);
+  return await res.text();
+}
 
-  const M = mat4.clone(stack.current);                  // copy: the caller's matrix stays unscaled
+function createShader(gl, type, source) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, source);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(sh));
+    gl.deleteShader(sh);
+    throw new Error("Shader compile failed");
+  }
+  return sh;
+}
+
+function createProgram(gl, vsSrc, fsSrc) {
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    gl.deleteProgram(prog);
+    throw new Error("Program link failed");
+  }
+  return prog;
+}
+
+// ---------- Matrix Stack ----------
+const matrixStack = [];
+function pushMatrix(matrix) { matrixStack.push(mat4.clone(matrix)); }  // clone: matrices are passed by reference
+function popMatrix() { return matrixStack.pop(); }
+
+// Everything on the mountain stands on top of the grass
+const MOUNTAIN_TOP = MOUNTAIN_HEIGHT + GRASS_THICKNESS;
+
+const shapes = {};
+let aPosition, aShade, uModel, uView, uProj, uColor;
+
+function uploadShape(data) {
+  const posBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data.pos), gl.STATIC_DRAW);
+
+  const shadeBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, shadeBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data.shade), gl.STATIC_DRAW);
+
+  return { posBuffer, shadeBuffer, count: data.pos.length / 3 };
+}
+
+// Draws one part:  M = Parent x Local x S   (Local = T x R)
+// The scale is applied to a COPY, so it is not passed down to the children.
+function drawPart(shape, modelMatrix, size, color) {
+  const M = mat4.clone(modelMatrix);
   mat4.scale(M, M, size);
-  gl.uniformMatrix4fv(locs.u_ModelMatrix, false, M);
-  gl.uniformMatrix3fv(locs.u_NormalMatrix, false, mat3.normalFromMat4(mat3.create(), M));
-  gl.uniform3fv(locs.u_color, color);
-  gl.uniform1f(locs.u_unlit, options.unlit ? 1.0 : 0.0);
-  GLUtils.drawMesh(gl, mesh, locs);
+  gl.uniformMatrix4fv(uModel, false, M);
+  gl.uniform3fv(uColor, color);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, shape.posBuffer);
+  gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, shape.shadeBuffer);
+  gl.vertexAttribPointer(aShade, 1, gl.FLOAT, false, 0, 0);
+
+  gl.drawArrays(gl.TRIANGLES, 0, shape.count);
 }
 
-// ---------- TEST COMPONENT (shows every primitive + a parent/child chain) ----------
-function drawDemoScene(ctx) {
-  const { stack, drawPart, time } = ctx;
+function setCamera() {
+  const projectionMatrix = mat4.create();
+  mat4.perspective(projectionMatrix, Math.PI / 4, canvas.width / canvas.height, 0.1, 100);
 
-  // ground
-  drawPart("plane", [40, 1, 40], [0.35, 0.55, 0.30]);
+  // View matrix = inverse of the camera's own matrix
+  const cameraMatrix = mat4.create();
+  mat4.translate(cameraMatrix, cameraMatrix, [0, 10, 17]);
+  mat4.rotateX(cameraMatrix, cameraMatrix, -15 * Math.PI / 180);
+  const viewMatrix = mat4.create();
+  mat4.invert(viewMatrix, cameraMatrix);
 
-  // row of all primitives
-  const row = [["cube", [2, 2, 2], [0.8, 0.3, 0.3]], ["cylinder", [1, 2.5, 1], [0.3, 0.5, 0.8]],
-               ["cone", [1.2, 2.5, 1.2], [0.2, 0.6, 0.3]], ["sphere", [1.2, 1.2, 1.2], [0.9, 0.8, 0.3]],
-               ["hemisphere", [1.5, 1.5, 1.5], [0.7, 0.4, 0.8]], ["prism", [2.5, 2, 2.5], [0.8, 0.6, 0.4]]];
-  row.forEach((r, i) => {
-    stack.push();
-    stack.translate(-12.5 + i * 5, r[0] === "sphere" ? 1.2 : r[0] === "cube" ? 1 : 0, -8);
-    drawPart(r[0], r[1], r[2]);
-    stack.pop();
-  });
-
-  // hierarchy test: tower -> dome (rotates) -> telescope (tilts) - the telescope must follow the dome
-  stack.push();
-    stack.translate(0, 0, 4);
-    drawPart("cylinder", [2, 5, 2], [0.9, 0.88, 0.82]);                 // tower
-    stack.push();
-      stack.translate(0, 5, 0);
-      stack.rotateY(time * 0.6);                                          // dome turns
-      drawPart("hemisphere", [2.4, 2.4, 2.4], [0.75, 0.8, 0.86]);
-      stack.push();
-        stack.translate(0, 0.9, 0);
-        stack.rotateX(0.9 + 0.2 * Math.sin(time));                        // telescope tilts
-        drawPart("cylinder", [0.3, 3, 0.3], [0.25, 0.27, 0.34]);
-      stack.pop();
-    stack.pop();
-  stack.pop();
-
-  // unlit test (glowing sphere orbiting the tower)
-  stack.push();
-    stack.translate(0, 8, 4);
-    stack.rotateZ(time * 0.5);
-    stack.translate(10, 0, 0);
-    drawPart("sphere", [1, 1, 1], [1.0, 0.9, 0.4], { unlit: true });
-  stack.pop();
+  gl.uniformMatrix4fv(uProj, false, projectionMatrix);
+  gl.uniformMatrix4fv(uView, false, viewMatrix);
 }
 
-// ---------- main loop ----------
-function render(nowMs) {
-  const time = nowMs / 1000;
-  const dt = lastTime ? time - lastTime : 0;
-  lastTime = time;
-
-  if (GLUtils.resizeCanvasToDisplaySize(canvas)) gl.viewport(0, 0, canvas.width, canvas.height);
-  camera.setAspect(canvas.width, canvas.height);
-
-  gl.clearColor(0.53, 0.78, 0.95, 1);
+function drawScene() {
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  gl.clearColor(0.60, 0.80, 0.95, 1.0);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  gl.uniformMatrix4fv(locs.u_ViewMatrix, false, camera.getViewMatrix());
-  gl.uniformMatrix4fv(locs.u_ProjectionMatrix, false, camera.getProjectionMatrix());
-  lighting.apply(gl, locs);
+  // ROOT: Mountain (its local matrix is the identity, so it is also its world matrix)
+  let modelMatrix = mat4.create();
+  drawMountain(modelMatrix);
 
-  stack.reset();                                              // every frame starts at the root (identity)
-  const ctx = { gl, stack, drawPart, meshes, camera, lighting, time, dt };
-  for (const draw of COMPONENTS) {
-    const depth = stack.depth;
-    draw(ctx);
-    if (stack.depth !== depth) console.warn("Unbalanced push/pop in", draw.name);
-  }
-  requestAnimationFrame(render);
+  // Children of the Mountain: push saves the Mountain matrix, pop restores it for the next child
+  pushMatrix(modelMatrix);  drawGrassTop(modelMatrix);     modelMatrix = popMatrix();
+  pushMatrix(modelMatrix);  drawObservatory(modelMatrix);  modelMatrix = popMatrix();
+  pushMatrix(modelMatrix);  drawTent(modelMatrix);         modelMatrix = popMatrix();
+  pushMatrix(modelMatrix);  drawFirePit(modelMatrix);      modelMatrix = popMatrix();
+  pushMatrix(modelMatrix);  drawSky(modelMatrix);          modelMatrix = popMatrix();
 }
 
 async function main() {
-  const program = await GLUtils.createProgramFromFiles(gl, "vertex.glsl", "fragment.glsl");
+  const [vs, fs] = await Promise.all([loadText("shaders/vertex.glsl"), loadText("shaders/fragment.glsl")]);
+  const program = createProgram(gl, vs, fs);
   gl.useProgram(program);
 
-  locs = GLUtils.getLocations(gl, program,
-    ["a_position", "a_normal"],
-    ["u_ModelMatrix", "u_ViewMatrix", "u_ProjectionMatrix", "u_NormalMatrix",
-     "u_color", "u_unlit", "u_lightDir", "u_lightColor", "u_ambient", "u_brightness"]);
-  gl.enableVertexAttribArray(locs.a_position);
-  gl.enableVertexAttribArray(locs.a_normal);
+  aPosition = gl.getAttribLocation(program, "a_position");
+  aShade    = gl.getAttribLocation(program, "a_shade");
+  gl.enableVertexAttribArray(aPosition);
+  gl.enableVertexAttribArray(aShade);
 
-  // Build every primitive once; all components reuse them.
-  meshes.cube       = GLUtils.createMesh(gl, Primitives.cube());
-  meshes.cylinder   = GLUtils.createMesh(gl, Primitives.cylinder(24));
-  meshes.cone       = GLUtils.createMesh(gl, Primitives.cone(24));
-  meshes.sphere     = GLUtils.createMesh(gl, Primitives.sphere(16, 24));
-  meshes.hemisphere = GLUtils.createMesh(gl, Primitives.hemisphere(8, 24));
-  meshes.prism      = GLUtils.createMesh(gl, Primitives.triangularPrism());
-  meshes.plane      = GLUtils.createMesh(gl, Primitives.plane(1));
+  uModel = gl.getUniformLocation(program, "u_ModelMatrix");
+  uView  = gl.getUniformLocation(program, "u_ViewMatrix");
+  uProj  = gl.getUniformLocation(program, "u_ProjectionMatrix");
+  uColor = gl.getUniformLocation(program, "u_color");
+
+  shapes.cylinder = uploadShape(buildCylinder(12));
+  shapes.cone     = uploadShape(buildCone(12));
+  shapes.prism    = uploadShape(buildPrism());
+  shapes.mountain = uploadShape(buildCylinder(12, MOUNTAIN_TOP_SIZE));
 
   gl.enable(gl.DEPTH_TEST);
-  camera.distance = 32;                 // closer than the default so the demo fills the view
-  camera.attachMouseControls(canvas);
-  requestAnimationFrame(render);
+  setCamera();
+  drawScene();  
 }
 
-main().catch(err => { console.error(err); alert(err.message); });
+main().catch(err => console.error(err));
